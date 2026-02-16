@@ -7,7 +7,6 @@
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
-extern crate alloc;
 
 mod app;
 mod qr_encode;
@@ -21,7 +20,7 @@ use num_traits::ToPrimitive;
 // Server name for xous names registration (underscored)
 const SERVER_NAME: &str = "_QR Code Generator_";
 // App name for GAM registration (must match manifest context_name)
-const APP_NAME: &str = "QR Code";
+const APP_NAME: &str = "QR Code Generator";
 
 /// Opcodes for the application main loop.
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
@@ -53,8 +52,8 @@ fn main() -> ! {
     // Register UX with GAM
     let token = gam
         .register_ux(gam::UxRegistration {
-            app_name: alloc::string::String::from(APP_NAME),
-            ux_type: gam::UxType::Chat,
+            app_name: String::from(gam::APP_NAME_QRCODE_APP),
+            ux_type: gam::UxType::Framebuffer,
             predictor: None,
             listener: sid.to_array(),
             redraw_id: AppOp::Redraw.to_u32().unwrap(),
