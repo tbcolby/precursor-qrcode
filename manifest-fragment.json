@@ -4,7 +4,10 @@
         "menu_name": {
             "appmenu.qrcode-app": {
                 "en": "QR Code",
-                "en-tts": "QR Code"
+                "en-tts": "QR Code",
+                "fr": "QR Code",
+                "ja": "QR Code",
+                "zh": "QR Code"
             }
         }
     }
