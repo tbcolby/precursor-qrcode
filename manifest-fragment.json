@@ -1,0 +1,11 @@
+{
+    "qrcode-app": {
+        "context_name": "QR Code",
+        "menu_name": {
+            "appmenu.qrcode-app": {
+                "en": "QR Code",
+                "en-tts": "QR Code"
+            }
+        }
+    }
+}

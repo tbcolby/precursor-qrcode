@@ -1,479 +1,479 @@
-//! Application state machine and input handling for the QR Code Generator.
+//! Screens, key handling and persistence. The encoder and the saved-code
+//! model are in `qrcode-app-core`; drawing is in `ui.rs`.
 
-extern crate alloc;
-use alloc::string::String;
-use alloc::vec::Vec;
+use precursor_appkit::keys::Key;
+use precursor_appkit::layout::ListState;
+use precursor_appkit::screen::Screen;
+use precursor_appkit::store::Store;
+use qrcode_app_core::model::{self, MAX_NAME_LEN};
+use qrcode_app_core::{encode, Codes, EcLevel, IndexRecord, LegacyCode, QrCode, Settings, Template, TextField};
 
-use crate::qr_encode::{self, EcLevel, QrMatrix};
-use crate::storage::Storage;
+/// PDDB dictionaries (same names as version 0.1, so existing data is found).
+pub const SETTINGS_DICT: &str = "qrcode.settings";
+pub const CODES_DICT: &str = "qrcode.codes";
+const SETTINGS_KEY: &str = "config";
+const CODES_KEY: &str = "index";
 
-// Standard key codes (ecosystem standard)
-const KEY_UP: char = '\u{2191}';
-const KEY_DOWN: char = '\u{2193}';
-const KEY_LEFT: char = '\u{2190}';
-const KEY_RIGHT: char = '\u{2192}';
-const KEY_ENTER: char = '\r';
-const KEY_BACKSPACE: char = '\u{0008}';
-const KEY_MENU: char = '\u{2234}';
+#[derive(PartialEq, Eq)]
+pub enum Action {
+    Stay,
+    Leave,
+}
 
-/// Maximum text length we support (Version 10, EC-L, Byte mode = 271 chars).
-const MAX_TEXT_LEN: usize = 271;
-
-/// App states
-#[derive(Debug, Clone, PartialEq)]
-pub enum AppState {
-    MainMenu,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum View {
+    Menu,
     Input,
     Display,
-    SavePrompt,
-    SaveNameEntry,
-    LoadList,
+    SaveName,
+    Saved,
     Settings,
     Help,
 }
 
-/// Menu items for the main menu
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MenuItem {
-    NewQr,
-    SavedCodes,
-    Settings,
-    Help,
+pub const MENU_ITEMS: [&str; 4] = ["New QR code", "Saved codes", "Settings", "Help"];
+pub const SETTINGS_ROWS: usize = 3;
+
+pub struct App {
+    pub(crate) screen: Screen,
+    settings_store: Store,
+    codes_store: Store,
+
+    pub(crate) view: View,
+    pub(crate) menu: ListState,
+    pub(crate) saved_list: ListState,
+    pub(crate) settings_row: usize,
+    pub(crate) visible_rows: usize,
+
+    pub(crate) settings: Settings,
+    settings_dirty: bool,
+    pub(crate) codes: Codes,
+    codes_read_only: bool,
+
+    pub(crate) input: TextField,
+    pub(crate) name: TextField,
+    /// The code on screen and the text it encodes.
+    pub(crate) qr: Option<QrCode>,
+    pub(crate) qr_text: String,
+    display_return: View,
+    pub(crate) confirm_delete: bool,
+    pub(crate) status: String,
 }
 
-impl MenuItem {
-    pub fn label(&self) -> &'static str {
-        match self {
-            MenuItem::NewQr => "New QR Code",
-            MenuItem::SavedCodes => "Saved Codes",
-            MenuItem::Settings => "Settings",
-            MenuItem::Help => "Help",
-        }
-    }
-
-    pub fn all() -> &'static [MenuItem] {
-        &[
-            MenuItem::NewQr,
-            MenuItem::SavedCodes,
-            MenuItem::Settings,
-            MenuItem::Help,
-        ]
-    }
-}
-
-/// Settings for the QR encoder
-#[derive(Debug, Clone)]
-pub struct QrSettings {
-    pub ec_level: EcLevel,
-    pub module_size: u8, // 0 = auto, 3-6 = fixed
-}
-
-impl Default for QrSettings {
-    fn default() -> Self {
-        Self {
-            ec_level: EcLevel::M,
-            module_size: 0,
-        }
-    }
-}
-
-/// Saved QR code entry
-#[derive(Debug, Clone)]
-pub struct SavedCode {
-    pub name: String,
-    pub text: String,
-    pub ec_level: EcLevel,
-}
-
-/// The main application state
-pub struct QrApp {
-    pub state: AppState,
-    pub menu_index: usize,
-    pub input_text: String,
-    pub qr_matrix: Option<QrMatrix>,
-    pub qr_text: String, // the text that was encoded
-    pub settings: QrSettings,
-    pub saved_codes: Vec<SavedCode>,
-    pub load_index: usize,
-    pub save_name: String,
-    pub settings_index: usize,
-    pub needs_redraw: bool,
-    storage: Option<Storage>,
-}
-
-impl QrApp {
-    pub fn new() -> Self {
-        Self {
-            state: AppState::MainMenu,
-            menu_index: 0,
-            input_text: String::new(),
-            qr_matrix: None,
+impl App {
+    pub fn new(screen: Screen, settings_store: Store, codes_store: Store) -> Self {
+        let mut app = Self {
+            screen,
+            settings_store,
+            codes_store,
+            view: View::Menu,
+            menu: ListState::default(),
+            saved_list: ListState::default(),
+            settings_row: 0,
+            visible_rows: 1,
+            settings: Settings::default(),
+            settings_dirty: false,
+            codes: Codes::new(),
+            codes_read_only: false,
+            input: TextField::new(model::max_text_len()),
+            name: TextField::new(MAX_NAME_LEN),
+            qr: None,
             qr_text: String::new(),
-            settings: QrSettings::default(),
-            saved_codes: Vec::new(),
-            load_index: 0,
-            save_name: String::new(),
-            settings_index: 0,
-            needs_redraw: true,
-            storage: None,
-        }
+            display_return: View::Input,
+            confirm_delete: false,
+            status: String::new(),
+        };
+        app.reload();
+        app
     }
 
-    /// Initialize PDDB storage and load saved data.
-    pub fn init_storage(&mut self) {
-        match Storage::new() {
-            Ok(mut s) => {
-                // Load settings
-                if let Some(settings) = s.load_settings() {
-                    self.settings = settings;
-                }
-                // Load saved codes
-                self.saved_codes = s.load_codes();
-                self.storage = Some(s);
-            }
+    pub fn screen(&self) -> &Screen { &self.screen }
+
+    /// (Re)load from the PDDB. Called at start and whenever the set of open
+    /// bases changes, so nothing from a just-locked basis stays on screen.
+    pub fn reload(&mut self) {
+        self.settings = match self.settings_store.load::<Settings>(SETTINGS_KEY) {
+            Ok(Some(s)) => s.sanitized(),
+            Ok(None) => Settings::default(),
             Err(e) => {
-                log::warn!("Failed to initialize storage: {:?}", e);
+                log::warn!("settings unreadable ({:?}); using defaults", e.kind());
+                Settings::default()
+            }
+        };
+        self.settings_dirty = false;
+        self.load_codes();
+        self.clear_code();
+        self.input.clear();
+        self.name.clear();
+        self.confirm_delete = false;
+        self.saved_list = ListState::default();
+        self.view = View::Menu;
+    }
+
+    fn clear_code(&mut self) {
+        self.qr = None;
+        self.qr_text.clear();
+    }
+
+    fn load_codes(&mut self) {
+        self.codes_read_only = false;
+        self.codes = match self.codes_store.load::<IndexRecord>(CODES_KEY) {
+            Ok(None) => Codes::new(),
+            Ok(Some(IndexRecord::Current(c))) => match c.check_version() {
+                Ok(()) => c,
+                Err(v) => {
+                    log::warn!("saved codes are version {v}, newer than this app");
+                    self.codes_read_only = true;
+                    self.status = "Saved codes are from a newer app version".into();
+                    Codes::new()
+                }
+            },
+            Ok(Some(IndexRecord::Legacy(names))) => self.migrate_legacy(names),
+            Err(e) => {
+                log::error!("saved codes unreadable: {:?}", e.kind());
+                self.codes_read_only = true;
+                self.status = "Couldn't read saved codes".into();
+                Codes::new()
+            }
+        };
+    }
+
+    /// Convert the 0.1 layout (index of names + one `code.<name>` key each)
+    /// to one record, then delete every old payload key, including orphans
+    /// left by 0.1's delete.
+    fn migrate_legacy(&mut self, names: Vec<String>) -> Codes {
+        let entries = names
+            .into_iter()
+            .map(|n| {
+                let payload = self.codes_store.load::<LegacyCode>(&model::legacy_code_key(&n)).ok().flatten();
+                (n, payload)
+            })
+            .collect();
+        let codes = model::migrate_legacy(entries);
+        if let Err(e) = self.codes_store.save(CODES_KEY, &codes) {
+            log::error!("migration save failed: {:?}", e.kind());
+            self.codes_read_only = true;
+            return codes;
+        }
+        for key in self.codes_store.keys().unwrap_or_default() {
+            if model::is_legacy_code_key(&key) {
+                if let Err(e) = self.codes_store.delete(&key) {
+                    log::warn!("couldn't delete old key: {:?}", e.kind());
+                }
+            }
+        }
+        log::info!("migrated {} saved codes to the v1 layout", codes.len());
+        codes
+    }
+
+    fn save_codes(&mut self) -> bool {
+        if self.codes_read_only {
+            self.status = "Saved codes are read-only".into();
+            return false;
+        }
+        match self.codes_store.save(CODES_KEY, &self.codes) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("save failed: {:?}", e.kind());
+                self.status = "Save failed".into();
+                false
             }
         }
     }
 
-    /// Save current settings to PDDB.
-    pub fn save_settings(&mut self) {
-        if let Some(ref mut s) = self.storage {
-            s.save_settings(&self.settings);
+    fn save_settings(&mut self) {
+        if !self.settings_dirty {
+            return;
+        }
+        match self.settings_store.save(SETTINGS_KEY, &self.settings) {
+            Ok(()) => self.settings_dirty = false,
+            Err(e) => log::error!("settings save failed: {:?}", e.kind()),
         }
     }
 
-    /// Save state when backgrounding or quitting.
-    pub fn save_state(&mut self) {
+    pub(crate) fn codes_basis(&self) -> String {
+        self.codes_store
+            .basis_of(CODES_KEY)
+            .ok()
+            .flatten()
+            .or_else(|| self.codes_store.target_basis())
+            .unwrap_or_else(|| "?".into())
+    }
+
+    /// Smaller canvas side: the square the code must fit in, minus room for
+    /// the info line and footer.
+    pub(crate) fn code_area(&self) -> usize {
+        let s = self.screen.size();
+        let reserved = 3 * self.screen.line_height(gam::GlyphStyle::Small) + 12;
+        s.x.min(s.y - reserved).max(0) as usize
+    }
+
+    pub fn on_foreground(&mut self) {
+        self.screen.refresh_size();
+        self.draw();
+    }
+
+    /// Save changed settings; optionally take the code off the screen.
+    pub fn on_background(&mut self) {
         self.save_settings();
-    }
-
-    /// Handle a key press. Returns false if the app should quit.
-    pub fn handle_key(&mut self, key: char) -> bool {
-        self.needs_redraw = true;
-
-        match self.state {
-            AppState::MainMenu => self.handle_menu_key(key),
-            AppState::Input => self.handle_input_key(key),
-            AppState::Display => self.handle_display_key(key),
-            AppState::SavePrompt => self.handle_save_prompt_key(key),
-            AppState::SaveNameEntry => self.handle_save_name_key(key),
-            AppState::LoadList => self.handle_load_key(key),
-            AppState::Settings => self.handle_settings_key(key),
-            AppState::Help => self.handle_help_key(key),
+        if self.settings.hide_on_background && matches!(self.view, View::Display | View::SaveName) {
+            self.clear_code();
+            self.view = View::Menu;
         }
     }
 
-    fn handle_menu_key(&mut self, key: char) -> bool {
-        let items = MenuItem::all();
+    pub fn draw(&mut self) { crate::ui::draw(self); }
+
+    pub fn on_key(&mut self, key: Key) -> Action {
+        self.status.clear();
+        if !matches!(key, Key::Char('d') | Key::Char('D')) {
+            self.confirm_delete = false;
+        }
+        match self.view {
+            View::Menu => return self.key_menu(key),
+            View::Input => self.key_input(key),
+            View::Display => self.key_display(key),
+            View::SaveName => self.key_save_name(key),
+            View::Saved => self.key_saved(key),
+            View::Settings => self.key_settings(key),
+            View::Help => {
+                if key.is_back() || key == Key::Enter {
+                    self.view = View::Menu;
+                }
+            }
+        }
+        Action::Stay
+    }
+
+    fn key_menu(&mut self, key: Key) -> Action {
         match key {
-            KEY_UP => {
-                if self.menu_index > 0 {
-                    self.menu_index -= 1;
+            Key::Up => self.menu.step_wrapping(-1, MENU_ITEMS.len(), MENU_ITEMS.len()),
+            Key::Down => self.menu.step_wrapping(1, MENU_ITEMS.len(), MENU_ITEMS.len()),
+            Key::Enter => match self.menu.selected {
+                0 => self.start_input(),
+                1 => {
+                    self.saved_list.clamp(self.codes.len(), self.visible_rows);
+                    self.view = View::Saved;
                 }
-            }
-            KEY_DOWN => {
-                if self.menu_index < items.len() - 1 {
-                    self.menu_index += 1;
+                2 => {
+                    self.settings_row = 0;
+                    self.view = View::Settings;
                 }
-            }
-            KEY_ENTER | KEY_MENU => {
-                match items[self.menu_index] {
-                    MenuItem::NewQr => {
-                        self.input_text.clear();
-                        self.state = AppState::Input;
-                    }
-                    MenuItem::SavedCodes => {
-                        self.load_index = 0;
-                        self.state = AppState::LoadList;
-                    }
-                    MenuItem::Settings => {
-                        self.settings_index = 0;
-                        self.state = AppState::Settings;
-                    }
-                    MenuItem::Help => {
-                        self.state = AppState::Help;
-                    }
-                }
-            }
-            'n' | 'N' => {
-                self.input_text.clear();
-                self.state = AppState::Input;
-            }
-            'q' | 'Q' => return false,
-            _ => self.needs_redraw = false,
-        }
-        true
-    }
-
-    fn handle_input_key(&mut self, key: char) -> bool {
-        match key {
-            KEY_ENTER => {
-                if !self.input_text.is_empty() {
-                    self.generate_qr();
-                }
-            }
-            KEY_BACKSPACE => {
-                self.input_text.pop();
-            }
-            'q' | 'Q' => {
-                if self.input_text.is_empty() {
-                    self.state = AppState::MainMenu;
-                } else {
-                    // Q in input mode types 'q' if there's text
-                    if self.input_text.len() < MAX_TEXT_LEN {
-                        self.input_text.push(key);
-                    }
-                }
-            }
-            // F4: Clear all input
-            '\u{F004}' => {
-                self.input_text.clear();
-            }
-            // F1: WiFi template
-            '\u{F001}' => {
-                self.input_text = String::from("WIFI:T:WPA;S:;P:;;");
-            }
-            // F2: URL template
-            '\u{F002}' => {
-                self.input_text = String::from("https://");
-            }
-            // F3: vCard template
-            '\u{F003}' => {
-                self.input_text = String::from("BEGIN:VCARD\nVERSION:3.0\nN:;;\nEND:VCARD");
-            }
-            _ => {
-                // Accept printable ASCII and common symbols
-                if key.is_ascii_graphic() || key == ' ' {
-                    if self.input_text.len() < MAX_TEXT_LEN {
-                        self.input_text.push(key);
-                    }
-                } else {
-                    self.needs_redraw = false;
-                }
-            }
-        }
-        true
-    }
-
-    fn generate_qr(&mut self) {
-        match qr_encode::encode(&self.input_text, self.settings.ec_level) {
-            Some(matrix) => {
-                self.qr_matrix = Some(matrix);
-                self.qr_text = self.input_text.clone();
-                self.state = AppState::Display;
-            }
-            None => {
-                log::warn!("Text too long for QR version 1-10");
-                // Stay on input screen — text too long
-            }
-        }
-    }
-
-    fn handle_display_key(&mut self, key: char) -> bool {
-        match key {
-            'q' | 'Q' => {
-                self.state = AppState::MainMenu;
-            }
-            'n' | 'N' => {
-                self.input_text.clear();
-                self.state = AppState::Input;
-            }
-            's' | 'S' => {
-                self.save_name.clear();
-                self.state = AppState::SavePrompt;
-            }
-            KEY_UP => {
-                // Increase module size
-                if self.settings.module_size == 0 {
-                    self.settings.module_size = 3;
-                } else if self.settings.module_size < 8 {
-                    self.settings.module_size += 1;
-                }
+                _ => self.view = View::Help,
+            },
+            Key::Char('n') | Key::Char('N') => self.start_input(),
+            k if k.is_back() => {
                 self.save_settings();
+                return Action::Leave;
             }
-            KEY_DOWN => {
-                // Decrease module size
-                if self.settings.module_size <= 3 {
-                    self.settings.module_size = 0; // auto
+            _ => {}
+        }
+        Action::Stay
+    }
+
+    fn start_input(&mut self) {
+        self.input.clear();
+        self.view = View::Input;
+    }
+
+    fn template(&mut self, t: Template) {
+        let (text, cursor) = t.text_and_cursor();
+        self.input.set(text, cursor);
+    }
+
+    fn key_input(&mut self, key: Key) {
+        match key {
+            Key::Enter => self.generate(),
+            Key::Backspace => {
+                if self.input.is_empty() {
+                    self.view = View::Menu;
                 } else {
-                    self.settings.module_size -= 1;
+                    self.input.backspace();
                 }
+            }
+            Key::F(4) => {
+                // First press clears, second (on an empty field) goes back.
+                if self.input.is_empty() {
+                    self.view = View::Menu;
+                } else {
+                    self.input.clear();
+                }
+            }
+            Key::F(1) => self.template(Template::Wifi),
+            Key::F(2) => self.template(Template::Url),
+            Key::F(3) => self.template(Template::VCard),
+            Key::Left => self.input.left(),
+            Key::Right => self.input.right(),
+            Key::Up => self.input.home(),
+            Key::Down => self.input.end(),
+            Key::Char(c) => {
+                if !self.input.insert(c) && self.input.len() >= self.input.max() {
+                    self.status = format!("Limit is {} characters", self.input.max());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn generate(&mut self) {
+        let text = self.input.as_str().to_string();
+        self.show(&text, self.settings.ec_level, View::Input);
+    }
+
+    /// Encode and show `text` at `ec`, or put the reason in the status line.
+    fn show(&mut self, text: &str, ec: EcLevel, back_to: View) {
+        match self.encode_fitting(text, ec) {
+            Ok(q) => {
+                self.qr = Some(q);
+                self.qr_text = text.to_string();
+                self.display_return = back_to;
+                self.view = View::Display;
+            }
+            Err(msg) => self.status = msg,
+        }
+    }
+
+    pub(crate) fn encode_fitting(&self, text: &str, ec: EcLevel) -> Result<QrCode, String> {
+        let q = encode(text, ec).map_err(|e| e.to_string())?;
+        let area = self.code_area();
+        if qrcode_app_core::module_px(q.size, area, 1).is_none() {
+            return Err(format!("Version {} doesn't fit the screen", q.version));
+        }
+        Ok(q)
+    }
+
+    fn key_display(&mut self, key: Key) {
+        match key {
+            Key::Up => {
+                self.settings.bigger();
+                self.settings_dirty = true;
+            }
+            Key::Down => {
+                self.settings.smaller();
+                self.settings_dirty = true;
+            }
+            Key::Left | Key::Right => {
+                // Re-encode this code at another EC level (doesn't change the default).
+                if let Some(q) = self.qr.as_ref() {
+                    let ec = if key == Key::Right { q.ec.next() } else { q.ec.prev() };
+                    let text = self.qr_text.clone();
+                    match self.encode_fitting(&text, ec) {
+                        Ok(q) => self.qr = Some(q),
+                        Err(msg) => self.status = msg,
+                    }
+                }
+            }
+            Key::Char('s') | Key::Char('S') => {
+                self.name.clear();
+                self.view = View::SaveName;
+            }
+            Key::Char('n') | Key::Char('N') => self.start_input(),
+            k if k.is_back() => {
                 self.save_settings();
+                self.clear_code();
+                self.view = self.display_return;
             }
-            _ => self.needs_redraw = false,
+            _ => {}
         }
-        true
     }
 
-    fn handle_save_prompt_key(&mut self, key: char) -> bool {
+    fn key_save_name(&mut self, key: Key) {
         match key {
-            'y' | 'Y' | KEY_ENTER => {
-                self.save_name.clear();
-                self.state = AppState::SaveNameEntry;
-            }
-            'n' | 'N' | 'q' | 'Q' => {
-                self.state = AppState::Display;
-            }
-            _ => self.needs_redraw = false,
-        }
-        true
-    }
-
-    fn handle_save_name_key(&mut self, key: char) -> bool {
-        match key {
-            KEY_ENTER => {
-                if !self.save_name.is_empty() {
-                    let code = SavedCode {
-                        name: self.save_name.clone(),
-                        text: self.qr_text.clone(),
-                        ec_level: self.settings.ec_level,
-                    };
-                    self.saved_codes.push(code);
-                    if let Some(ref mut s) = self.storage {
-                        s.save_codes(&self.saved_codes);
-                    }
-                    self.state = AppState::Display;
-                }
-            }
-            KEY_BACKSPACE => {
-                self.save_name.pop();
-            }
-            'q' | 'Q' if self.save_name.is_empty() => {
-                self.state = AppState::Display;
-            }
-            _ => {
-                if key.is_ascii_graphic() || key == ' ' {
-                    if self.save_name.len() < 30 {
-                        self.save_name.push(key);
-                    }
-                } else {
-                    self.needs_redraw = false;
-                }
-            }
-        }
-        true
-    }
-
-    fn handle_load_key(&mut self, key: char) -> bool {
-        match key {
-            KEY_UP => {
-                if self.load_index > 0 {
-                    self.load_index -= 1;
-                }
-            }
-            KEY_DOWN => {
-                if !self.saved_codes.is_empty() && self.load_index < self.saved_codes.len() - 1 {
-                    self.load_index += 1;
-                }
-            }
-            KEY_ENTER => {
-                if !self.saved_codes.is_empty() {
-                    let code = &self.saved_codes[self.load_index];
-                    self.input_text = code.text.clone();
-                    self.settings.ec_level = code.ec_level;
-                    self.generate_qr();
-                }
-            }
-            'd' | 'D' => {
-                if !self.saved_codes.is_empty() {
-                    self.saved_codes.remove(self.load_index);
-                    if let Some(ref mut s) = self.storage {
-                        s.save_codes(&self.saved_codes);
-                    }
-                    if self.load_index > 0 && self.load_index >= self.saved_codes.len() {
-                        self.load_index = self.saved_codes.len().saturating_sub(1);
-                    }
-                }
-            }
-            'q' | 'Q' => {
-                self.state = AppState::MainMenu;
-            }
-            _ => self.needs_redraw = false,
-        }
-        true
-    }
-
-    fn handle_settings_key(&mut self, key: char) -> bool {
-        match key {
-            KEY_UP => {
-                if self.settings_index > 0 {
-                    self.settings_index -= 1;
-                }
-            }
-            KEY_DOWN => {
-                if self.settings_index < 1 {
-                    // 2 settings: EC level, module size
-                    self.settings_index += 1;
-                }
-            }
-            KEY_LEFT | KEY_RIGHT | KEY_ENTER => {
-                match self.settings_index {
-                    0 => {
-                        // Cycle EC level
-                        self.settings.ec_level = self.settings.ec_level.next();
-                    }
-                    1 => {
-                        // Cycle module size
-                        if key == KEY_RIGHT || key == KEY_ENTER {
-                            self.settings.module_size = match self.settings.module_size {
-                                0 => 3,
-                                3 => 4,
-                                4 => 5,
-                                5 => 6,
-                                6 => 7,
-                                7 => 8,
-                                _ => 0,
-                            };
+            Key::Enter => {
+                let Some(ec) = self.qr.as_ref().map(|q| q.ec) else {
+                    self.view = View::Menu;
+                    return;
+                };
+                let text = self.qr_text.clone();
+                match self.codes.add(self.name.as_str(), &text, ec) {
+                    Ok(()) => {
+                        if self.save_codes() {
+                            self.status = format!("Saved \"{}\"", self.name.as_str().trim());
                         } else {
-                            self.settings.module_size = match self.settings.module_size {
-                                0 => 8,
-                                3 => 0,
-                                4 => 3,
-                                5 => 4,
-                                6 => 5,
-                                7 => 6,
-                                8 => 7,
-                                _ => 0,
-                            };
+                            self.codes.remove(self.codes.len() - 1);
+                        }
+                        self.view = View::Display;
+                    }
+                    Err(e) => self.status = e.to_string(),
+                }
+            }
+            Key::Backspace => {
+                if !self.name.backspace() {
+                    self.view = View::Display;
+                }
+            }
+            Key::F(4) => self.view = View::Display,
+            Key::Left => self.name.left(),
+            Key::Right => self.name.right(),
+            Key::Char(c) => {
+                self.name.insert(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn key_saved(&mut self, key: Key) {
+        let len = self.codes.len();
+        match key {
+            Key::Up => self.saved_list.step(-1, len, self.visible_rows),
+            Key::Down => self.saved_list.step(1, len, self.visible_rows),
+            Key::Enter => {
+                if let Some(c) = self.codes.get(self.saved_list.selected) {
+                    // Use the code's own EC level; the default setting is untouched.
+                    let (text, ec) = (c.text.clone(), c.ec_level);
+                    self.show(&text, ec, View::Saved);
+                }
+            }
+            Key::Char('d') | Key::Char('D') if len > 0 => {
+                if !self.confirm_delete {
+                    self.confirm_delete = true;
+                    self.status = "Press d again to delete".into();
+                } else {
+                    self.confirm_delete = false;
+                    let i = self.saved_list.selected;
+                    if let Some(removed) = self.codes.remove(i) {
+                        let name = removed.name.clone();
+                        if self.save_codes() {
+                            self.status = format!("Deleted \"{name}\"");
+                        } else {
+                            self.codes.restore(i, removed);
                         }
                     }
-                    _ => {}
+                    self.saved_list.clamp(self.codes.len(), self.visible_rows);
                 }
-                self.save_settings();
             }
-            'q' | 'Q' => {
-                self.state = AppState::MainMenu;
-            }
-            _ => self.needs_redraw = false,
+            k if k.is_back() => self.view = View::Menu,
+            _ => {}
         }
-        true
     }
 
-    fn handle_help_key(&mut self, key: char) -> bool {
+    fn key_settings(&mut self, key: Key) {
+        let forward = matches!(key, Key::Right | Key::Enter);
         match key {
-            'q' | 'Q' | KEY_ENTER | KEY_BACKSPACE => {
-                self.state = AppState::MainMenu;
+            Key::Up => self.settings_row = self.settings_row.checked_sub(1).unwrap_or(SETTINGS_ROWS - 1),
+            Key::Down => self.settings_row = (self.settings_row + 1) % SETTINGS_ROWS,
+            Key::Left | Key::Right | Key::Enter => {
+                match self.settings_row {
+                    0 => {
+                        self.settings.ec_level =
+                            if forward { self.settings.ec_level.next() } else { self.settings.ec_level.prev() }
+                    }
+                    1 => {
+                        if forward {
+                            self.settings.bigger()
+                        } else {
+                            self.settings.smaller()
+                        }
+                    }
+                    _ => self.settings.hide_on_background = !self.settings.hide_on_background,
+                }
+                self.settings_dirty = true;
             }
-            _ => self.needs_redraw = false,
-        }
-        true
-    }
-
-    /// Compute the effective module pixel size.
-    pub fn effective_module_size(&self) -> usize {
-        if self.settings.module_size > 0 {
-            return self.settings.module_size as usize;
-        }
-        // Auto-fit: maximize module size for display
-        if let Some(ref matrix) = self.qr_matrix {
-            let qr_modules = matrix.size + 8; // +8 for quiet zone (4 each side)
-            let avail = 336usize.min(460); // content area
-            let size = avail / qr_modules;
-            size.max(2).min(8)
-        } else {
-            5
+            k if k.is_back() => {
+                self.save_settings();
+                self.view = View::Menu;
+            }
+            _ => {}
         }
     }
 }

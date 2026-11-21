@@ -1,149 +1,92 @@
-//! Precursor QR Code Generator
+//! QR Code Generator for Precursor: QR versions 1-10 at EC L/M/Q/H on
+//! the 1-bit display.
 //!
-//! Air-gap data transfer via optical encoding. Type text on the Precursor
-//! keyboard, generate a QR code, hold the screen up to any phone camera.
-//! No network. No pairing. No drivers. No trust required.
-
-#![cfg_attr(target_os = "none", no_std)]
-#![cfg_attr(target_os = "none", no_main)]
-
+//! The encoder and the saved-code model live in `qrcode-app-core` (host-tested).
+//! This crate registers with GAM, routes messages, persists, and draws.
 
 mod app;
-mod qr_encode;
-mod storage;
 mod ui;
 
-use app::QrApp;
-use num_traits::FromPrimitive;
-use num_traits::ToPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
+use precursor_appkit::{app as kit, keys, store};
 
-// Server name for xous names registration (underscored)
+/// xous-names server name. Any unique string; NOT the GAM app name.
 const SERVER_NAME: &str = "_QR Code Generator_";
-// App name for GAM registration (must match manifest context_name)
-const APP_NAME: &str = "QR Code Generator";
 
-/// Opcodes for the application main loop.
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
-enum AppOp {
-    // GAM callbacks: 0-2
+pub(crate) enum AppOp {
     Redraw = 0,
-    Rawkeys = 1,
-    FocusChange = 2,
-
-    // Control: 255
-    Quit = 255,
+    Rawkeys,
+    FocusChange,
+    BasisChanged,
+    Quit,
 }
 
 fn main() -> ! {
-    // Initialize logging
     log_server::init_wait().unwrap();
     log::set_max_level(log::LevelFilter::Info);
-    log::info!("QR Code Generator starting, PID {}", xous::process::id());
+    log::info!("qrcode-app PID is {}", xous::process::id());
 
-    // Connect to name server and register
     let xns = xous_names::XousNames::new().unwrap();
-    let sid = xns
-        .register_name(SERVER_NAME, None)
-        .expect("can't register server");
+    let sid = xns.register_name(SERVER_NAME, None).expect("can't register server");
 
-    // Connect to GAM for graphics
-    let gam = gam::Gam::new(&xns).expect("can't connect to GAM");
+    // GAM app name comes from apps/manifest.json key "qrcode-app".
+    let reg = kit::register(
+        &xns,
+        sid,
+        gam::APP_NAME_QRCODE_APP,
+        gam::UxType::Framebuffer,
+        kit::Opcodes {
+            redraw: AppOp::Redraw.to_u32().unwrap(),
+            rawkeys: Some(AppOp::Rawkeys.to_u32().unwrap()),
+            focus_change: Some(AppOp::FocusChange.to_u32().unwrap()),
+            got_input: None,
+        },
+    );
 
-    // Register UX with GAM
-    let token = gam
-        .register_ux(gam::UxRegistration {
-            app_name: String::from(gam::APP_NAME_QRCODE_APP),
-            ux_type: gam::UxType::Framebuffer,
-            predictor: None,
-            listener: sid.to_array(),
-            redraw_id: AppOp::Redraw.to_u32().unwrap(),
-            gotinput_id: None,
-            audioframe_id: None,
-            rawkeys_id: Some(AppOp::Rawkeys.to_u32().unwrap()),
-            focuschange_id: Some(AppOp::FocusChange.to_u32().unwrap()),
-        })
-        .expect("couldn't register UX")
-        .unwrap();
+    let settings_store = store::Store::open(app::SETTINGS_DICT);
+    let codes_store = store::Store::open(app::CODES_DICT);
+    store::watch_bases(xous::connect(sid).unwrap(), AppOp::BasisChanged.to_usize().unwrap());
 
-    // Get drawing canvas
-    let content = gam
-        .request_content_canvas(token)
-        .expect("couldn't get canvas");
-    let screensize = gam
-        .get_canvas_bounds(content)
-        .expect("couldn't get dimensions");
-    log::info!("Canvas size: {:?}", screensize);
+    let mut app = app::App::new(reg.screen, settings_store, codes_store);
+    let mut foreground = true;
 
-    // Initialize app
-    let mut app = QrApp::new();
-    app.init_storage();
-    let mut allow_redraw = true;
-
-    // Initial draw
-    ui::draw(&app, &gam, content);
-
-    // Main event loop
     loop {
         let msg = xous::receive_message(sid).unwrap();
         match FromPrimitive::from_usize(msg.body.id()) {
             Some(AppOp::Redraw) => {
-                if allow_redraw {
-                    app.needs_redraw = true;
-                    ui::draw(&app, &gam, content);
+                if foreground {
+                    app.draw();
                 }
             }
             Some(AppOp::Rawkeys) => xous::msg_scalar_unpack!(msg, k1, k2, k3, k4, {
-                let keys = [
-                    core::char::from_u32(k1 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k2 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k3 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k4 as u32).unwrap_or('\u{0000}'),
-                ];
-
-                let mut should_quit = false;
-
-                for &key in keys.iter() {
-                    if key != '\u{0000}' {
-                        log::debug!("Key: {:?} (0x{:04X})", key, key as u32);
-
-                        if !app.handle_key(key) {
-                            should_quit = true;
-                            break;
-                        }
+                // Keys are never logged: the user may be typing a credential.
+                for key in keys::decode_rawkeys([k1, k2, k3, k4]) {
+                    if app.on_key(key) == app::Action::Leave {
+                        kit::leave(app.screen());
                     }
                 }
-
-                if should_quit {
-                    break;
-                }
-
-                if app.needs_redraw && allow_redraw {
-                    ui::draw(&app, &gam, content);
-                    app.needs_redraw = false;
+                if foreground {
+                    app.draw();
                 }
             }),
-            Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, state_code, _, _, _, {
-                match gam::FocusState::convert_focus_change(state_code) {
-                    gam::FocusState::Background => {
-                        allow_redraw = false;
-                        app.save_state();
-                    }
+            Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, code, _, _, _, {
+                match kit::focus_state(code) {
                     gam::FocusState::Foreground => {
-                        allow_redraw = true;
-                        ui::draw(&app, &gam, content);
+                        foreground = true;
+                        app.on_foreground();
+                    }
+                    gam::FocusState::Background => {
+                        foreground = false;
+                        app.on_background();
                     }
                 }
             }),
+            Some(AppOp::BasisChanged) => app.reload(),
             Some(AppOp::Quit) => break,
-            _ => log::warn!("unknown opcode: {:?}", msg.body.id()),
+            None => log::warn!("unknown opcode {:?}", msg.body.id()),
         }
     }
-
-    // Save state before exit
-    app.save_state();
-
-    // Cleanup
-    xns.unregister_server(sid).unwrap();
-    xous::destroy_server(sid).unwrap();
-    xous::terminate_process(0)
+    app.on_background();
+    kit::shutdown(&xns, sid)
 }
