@@ -1,0 +1,15 @@
+[package]
+name = "qrcode-app-core"
+version = "0.2.0"
+edition = "2021"
+description = "Pure logic for QR Code Generator: QR encoder (versions 1-10, EC L/M/Q/H) and the saved-code model. No Xous dependencies."
+license = "Apache-2.0"
+
+# Keep this crate free of xous/gam/pddb so `cargo test` runs on any machine.
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+# Independent encoder used only by the differential tests.
+qrcode = { version = "0.12", default-features = false }
