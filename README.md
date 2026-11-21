@@ -1,288 +1,96 @@
 # Precursor QR Code Generator
 
-**The air gap is the bridge.**
+Shows QR codes on the Precursor's 1-bit display so a phone or scanner can read text off the device without a cable or radio. Type text, press Enter, scan.
 
-```
-"The most secure channel between two devices
-is the one that never touches a wire.
-Light travels from screen to camera.
-No packets. No protocols. No trust required.
-Just photons and geometry."
-```
+Status: builds at the toolkit's xous-core anchor, clippy-clean, 26 host tests pass. **Not yet verified on Renode or hardware**: `capture.py` is written but the Renode capture hasn't been run, and no code has been scanned off a real device yet.
 
----
+## Features
 
-## What This Is
+- **QR versions 1-10** (21×21 to 57×57 modules), smallest version chosen automatically, **error correction L / M / Q / H** (default M).
+- **Modes**: numeric, alphanumeric (`0-9 A-Z space $ % * + - . / :`) or byte, whichever single mode fits the whole text. Maximum at EC-L: 652 digits, 395 alphanumeric characters, or 271 bytes; at EC-H: 288 / 174 / 119.
+- **All eight masks** are scored with the ISO/IEC 18004 penalty rules and the lowest is used.
+- **Live counter** while typing: "N of M bytes at EC-x", the version the text needs, or why it won't fit.
+- **Cursor editing** (← → move, ↑ ↓ start / end) and **templates**: F1 WiFi (`WIFI:T:WPA;S:;P:;;`, cursor in the SSID), F2 URL (`https://`), F3 vCard 3.0 skeleton (cursor in the name).
+- **Display**: the module size is the largest that fits, or a fixed 2-8 px (reduced automatically if the code wouldn't fit). 4-module quiet zone. ← → re-encodes the shown code at another EC level without changing your default.
+- **Saved codes** with unique names; each keeps its own EC level. Delete asks for confirmation (`d` twice) and removes the payload.
+- **Hide on focus loss** (on by default): when the app goes to the background, a displayed code is cleared and the app returns to its menu.
 
-Precursor QR Code Generator creates QR codes on the Precursor's 1-bit monochrome display. Type text on the physical keyboard, press Enter, and a standards-compliant QR code appears on screen. Point any phone camera at it. Transfer complete.
+The encoder is in `core/` (`qrcode-app-core`, no Xous dependencies). Its tests rebuild every version 1-10 × EC level × mode × mask combination with the independent [`qrcode`](https://crates.io/crates/qrcode) crate and require identical data codewords, interleaved codewords and module matrices. They also check the ISO/IEC 18004 capacity table, format- and version-information values, and the Reed-Solomon worked example.
 
-This is a from-scratch QR code encoder written in Rust with zero external dependencies. It implements the full ISO 18004 encoding pipeline: mode detection, Reed-Solomon error correction over GF(2^8), matrix construction with finder/alignment/timing patterns, all eight data masking patterns with penalty evaluation, and format information encoding. Versions 1 through 10. Error correction levels L, M, Q, and H.
+## Keys
 
-No crate pulled from the internet. No supply chain. Just math.
+Backspace or F4 leaves every screen. The `∴` key opens the system menu and never reaches the app.
 
----
+| Screen | Key | Action |
+|---|---|---|
+| Menu | ↑ ↓, Enter | Choose New QR code / Saved codes / Settings / Help |
+| | `n` | New QR code |
+| | Backspace, F4 | Leave the app (it stays running in the background) |
+| Input | type | Insert at the cursor (printable ASCII) |
+| | ← → / ↑ ↓ | Move the cursor / jump to start or end |
+| | Enter | Make the code, or show why it can't be made |
+| | F1 / F2 / F3 | WiFi / URL / vCard template (replaces the text) |
+| | Backspace | Delete before the cursor; on an empty field, back to the menu |
+| | F4 | Clear the field; on an empty field, back to the menu |
+| QR code | ↑ ↓ | Bigger / smaller modules (auto, 2-8 px) |
+| | ← → | Re-encode at the next / previous EC level |
+| | `s` | Save under a name |
+| | `n` | New code |
+| | Backspace, F4 | Back |
+| Save | type, Enter | Name (up to 24 characters), save |
+| | Backspace / F4 | Delete a character (empty: cancel) / cancel |
+| Saved codes | ↑ ↓, Enter | Show the selected code at its saved EC level |
+| | `d` `d` | Delete the selected code |
+| | Backspace, F4 | Back |
+| Settings | ↑ ↓, ← → / Enter | Choose a row (EC level, module size, hide on focus loss), change it |
+| | Backspace, F4 | Back (saves changed settings) |
 
-## Why This Project
+## Storage
 
-Every modern device has a dozen ways to send data to another device. Bluetooth. WiFi. NFC. AirDrop. QR codes. USB. Each one requires trust — trust that the protocol isn't compromised, trust that the radio isn't being intercepted, trust that the receiving device isn't logging the transfer.
+| PDDB dictionary | Key | Contents |
+|---|---|---|
+| `qrcode.settings` | `config` | `{"version":1,"ec_level":"M","module_size":0,"hide_on_background":true}` |
+| `qrcode.codes` | `index` | `{"version":1,"codes":[{"name":…,"text":…,"ec_level":…}]}` |
 
-Precursor was built to minimize trust. Its CPU is open-source. Its storage is hardware-encrypted. Its radio can be physically disabled. But until now, getting data *out* of the device meant either TCP over WiFi (requires network connectivity and trust in the network) or USB HID autotype (requires physical cable and trust in the USB stack).
+- Records are replaced with delete-then-write in the basis that already holds them; new records go to the most recently unlocked basis, and the save screen shows which basis the saved codes live in.
+- Settings are written only when they changed (when leaving Settings or the code screen, or on focus loss). Saved codes are written when you add or delete one.
+- When a PDDB basis is locked or unlocked the app reloads everything and returns to the menu, so codes from a locked basis don't stay on screen.
+- A record that can't be read, or that a newer version wrote, is never overwritten; the app shows a message.
+- **Upgrading from 0.1**: 0.1 kept one `code.<name>` key per code and its delete never removed them. On first load the app moves those codes into the single `index` record and deletes every `code.*` key, including ones 0.1 failed to delete.
 
-QR codes require trusting only physics.
+## Limitations and security notes
 
-Light leaves the display. It enters a camera. The geometry of the pattern encodes the data. There is no radio to intercept, no protocol to compromise, no handshake to man-in-the-middle. The air gap between screen and camera is the most auditable communication channel in computing.
-
-This is not a convenience feature. On a security-focused device, it is an *architectural primitive*.
-
----
-
-## Why Precursor
-
-The match between QR codes and Precursor hardware is almost suspicious in its perfection.
-
-**1-bit display IS the QR spec.** QR codes are black and white modules. The Precursor display is black and white pixels. There is no color mapping, no dithering, no approximation. Every dark module is a block of `PixelColor::Dark` pixels. Every light module is `PixelColor::Light`. The display *is* the encoding.
-
-**336x536 resolution is generous.** A Version 6 QR code (41x41 modules) at 6 pixels per module with 4-module quiet zone is 294x294 pixels — fits with room for a status bar. Even Version 10 (57x57 modules) at 5px/module is 325x325 — still fits. The display is large enough for meaningful data capacity.
-
-**Physical keyboard for direct entry.** No on-screen keyboard stealing display real estate. No autocorrect mangling URLs. No predictive text leaking your input to a language model. You type what you mean. The QR code encodes what you typed.
-
-**PDDB for encrypted storage.** WiFi passwords, bitcoin addresses, API keys — the kind of data you encode into QR codes is often sensitive. On Precursor, saved codes live in hardware-encrypted flash with plausible deniability. Your QR code library is private by design.
-
-**No network dependency.** The entire point is that QR codes work without a network. The app works without WiFi. There is nothing to connect to, nothing to authenticate, nothing that can fail because a server is down.
-
----
-
-## How It Works
-
-### Features
-
-- **Text input** with live character count, mode detection, and version preview
-- **QR encoding** from scratch: Numeric, Alphanumeric, and Byte modes
-- **Versions 1-10** (21x21 to 57x57 modules) — auto-selected for minimum size
-- **Error correction** L/M/Q/H — configurable, defaults to M (~15% recovery)
-- **Auto-fit display** — maximizes module size for readability
-- **Adjustable module size** — 3px to 8px per module, or auto
-- **Save/load codes** to encrypted PDDB storage
-- **Templates** — WiFi network, URL, vCard pre-fills
-- **Full quiet zone** — 4-module white border per QR specification
-
-### Keyboard Controls
-
-#### Main Menu
-| Key | Action |
-|-----|--------|
-| Up/Down | Navigate menu |
-| Enter | Select |
-| N | New QR code |
-| Q | Quit |
-
-#### Text Input
-| Key | Action |
-|-----|--------|
-| A-Z, 0-9, symbols | Type text |
-| Backspace | Delete last character |
-| Enter | Generate QR code |
-| F1 | WiFi template |
-| F2 | URL template (pre-fills https://) |
-| F3 | vCard template |
-| F4 | Clear all input |
-| Q | Back (when input is empty) |
-
-#### QR Display
-| Key | Action |
-|-----|--------|
-| S | Save this code |
-| N | New code |
-| Up | Increase module size |
-| Down | Decrease module size |
-| Q | Back to menu |
-
-#### Saved Codes
-| Key | Action |
-|-----|--------|
-| Up/Down | Navigate list |
-| Enter | Load and display |
-| D | Delete selected |
-| Q | Back to menu |
-
-### Templates
-
-**WiFi**: Generates `WIFI:T:WPA;S:;P:;;` — fill in SSID and password. Most phones auto-connect when they scan this.
-
-**URL**: Pre-fills `https://` — just type the domain and path.
-
-**vCard**: Generates a vCard 3.0 skeleton — fill in name and contact info.
-
----
-
-## Screenshots
-
-*Captured via headless Renode emulation on macOS ARM64. The Precursor display is 336x536 pixels, 1-bit monochrome.*
-
-*(Screenshots will be captured after Renode testing)*
-
----
-
-## Technical Architecture
-
-```
-apps/qrcode/
-├── Cargo.toml        # Dependencies: xous, gam, pddb, serde
-└── src/
-    ├── main.rs       # Entry point, event loop, GAM registration
-    ├── app.rs        # State machine, input handling, settings
-    ├── qr_encode.rs  # Complete QR encoder: GF(2^8), Reed-Solomon,
-    │                  # data encoding, matrix, masking, format info
-    ├── ui.rs         # Screen rendering: menu, input, QR display,
-    │                  # save/load, settings, help
-    └── storage.rs    # PDDB persistence for codes and settings
-```
-
-### Design Decisions
-
-**From-scratch QR encoder.** No external QR crate. The entire encoding pipeline — Galois field arithmetic, Reed-Solomon error correction, data mode encoding, matrix construction, mask pattern evaluation, format information — is implemented in `qr_encode.rs`. This eliminates supply chain risk, ensures `no_std` compatibility, and gives us full control over the rendering pipeline. The encoder has zero Xous dependencies and could be extracted as a standalone library.
-
-**GF(2^8) with precomputed tables.** Reed-Solomon encoding requires Galois field multiplication. We precompute exp and log tables at runtime (512 + 256 bytes) for O(1) field operations. The generator polynomial for each EC block count is computed fresh — no static tables needed for the polynomial itself.
-
-**Eight-mask evaluation with full penalty scoring.** The QR spec defines four penalty rules for evaluating mask patterns. We apply all eight masks to a cloned matrix, score each, and select the minimum penalty. This is ~8x the work of a fixed mask but produces optimally scannable codes.
-
-**Chat UX with raw keys.** Like the calculator, we register for `UxType::Chat` with raw keyboard input. Every keypress goes through our own input handler — no GAM text pipeline interference.
-
-**JSON for PDDB storage.** Settings and saved codes use serde JSON. This is slightly larger than binary encoding but infinitely easier to debug, migrate, and inspect. For the small data sizes involved (a few KB total), the overhead is negligible.
-
-### PDDB Storage Layout
-
-| Dictionary | Key | Contents |
-|-----------|-----|----------|
-| `qrcode.settings` | `config` | `{ "ec_level": "M", "module_size": 0 }` |
-| `qrcode.codes` | `index` | JSON array of saved code names |
-| `qrcode.codes` | `code.{name}` | `{ "text": "...", "ec_level": "M" }` |
-
-### QR Encoding Pipeline
-
-```
-Text Input
-    │
-    ▼
-Mode Detection (Numeric > Alphanumeric > Byte)
-    │
-    ▼
-Version Selection (smallest V1-V10 that fits)
-    │
-    ▼
-Data Encoding (mode indicator + char count + payload)
-    │
-    ▼
-Reed-Solomon EC (GF(2^8) polynomial division)
-    │
-    ▼
-Block Interleaving (data + EC codewords)
-    │
-    ▼
-Matrix Construction (finder + alignment + timing patterns)
-    │
-    ▼
-Data Placement (zigzag traversal)
-    │
-    ▼
-Mask Evaluation (8 patterns × 4 penalty rules)
-    │
-    ▼
-Format Info (EC level + mask, BCH encoded)
-    │
-    ▼
-Final QR Matrix (ready to render)
-```
-
-### Dependencies
-
-```toml
-[dependencies]
-xous = "0.9.69"
-xous-ipc = "0.10.9"
-gam = { path = "../../services/gam" }
-pddb = { path = "../../services/pddb" }
-ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.68" }
-log-server = { package = "xous-api-log", version = "0.1.68" }
-xous-names = { package = "xous-api-names", version = "0.9.70" }
-num-derive = { version = "0.4.2", default-features = false }
-num-traits = { version = "0.2.14", default-features = false }
-serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
-serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
-log = "0.4.14"
-```
-
----
+- A QR code on screen can be read by any camera in view, including from a distance. Don't display secrets where others can see the screen.
+- The PDDB encrypts saved codes at rest. The app adds no protection of its own.
+- Versions above 10, mixed-mode segments, Kanji mode, ECI, and Micro QR are not implemented. Byte mode is plain ASCII (the keyboard input is ASCII).
+- WiFi templates aren't escaped for you: put a backslash before `\ ; , : "` in an SSID or password.
+- No import over the network (0.1 reserved TCP port 7880 for it; it was never implemented).
+- Screen geometry hasn't been checked on a device yet. Renode capture not yet run.
 
 ## Building
 
-Precursor QR Code Generator is a Xous app. It builds as part of the [xous-core](https://github.com/betrusted-io/xous-core) workspace.
+The app builds inside a [xous-core](https://github.com/betrusted-io/xous-core) tree. The package is `qrcode-app` (not `qrcode`, which would collide with the crate of that name), so the manifest key and `gam::APP_NAME_QRCODE_APP` match. With [xous-dev-toolkit](https://github.com/tbcolby/xous-dev-toolkit):
 
-### Integration
+```bash
+bin/integrate --xous-root ~/xous-core --grade ~/Dev/precursor/precursor-qrcode   # build, clippy, tests, lint
+cd ~/xous-core && cargo xtask renode-image qrcode-app                              # emulator image
+```
 
-1. Copy `src/` and `Cargo.toml` to `xous-core/apps/qrcode/`
+`bin/integrate` copies the app to `apps/qrcode-app`, merges `manifest-fragment.json` into `apps/manifest.json`, and adds the workspace member. Host tests alone: `cd core && cargo test`.
 
-2. Add to workspace `Cargo.toml`:
-   ```toml
-   "apps/qrcode",
-   ```
+## Layout
 
-3. Add to `apps/manifest.json`:
-   ```json
-   "qrcode": {
-       "context_name": "QR Code",
-       "menu_name": {
-           "appmenu.qrcode": {
-               "en": "QR Code",
-               "en-tts": "QR Code"
-           }
-       }
-   }
-   ```
-
-4. Build for Renode emulator:
-   ```bash
-   cargo xtask renode-image qrcode
-   ```
-
-5. Build for hardware:
-   ```bash
-   cargo xtask app-image qrcode
-   ```
-
----
-
-## Technical Notes
-
-- QR encoding is pure Rust with zero external dependencies beyond std/alloc
-- Reed-Solomon uses GF(2^8) with primitive polynomial 0x11D
-- All eight mask patterns evaluated with full four-rule penalty scoring
-- Supports Numeric (0-9), Alphanumeric (0-9, A-Z, symbols), and Byte (UTF-8) modes
-- Version auto-selection picks the smallest version that fits the data
-- Module size auto-fit maximizes readability on the 336px display
-- Saved codes are encrypted at rest via PDDB
-- The QR encoder module (`qr_encode.rs`) has zero Xous dependencies and could be extracted as a standalone `no_std` library
-
----
-
-## Development
-
-This app was developed using the methodology described in [xous-dev-toolkit](https://github.com/tbcolby/xous-dev-toolkit) — an LLM-assisted approach to Precursor app development on macOS ARM64.
-
-App #1 in the 32-app Precursor ecosystem campaign.
-
----
+```
+Cargo.toml               app crate: gam, precursor-appkit, qrcode-app-core
+core/src/encode.rs       QR encoder: modes, RS over GF(256), placement, masks, format/version info
+core/src/model.rs        settings, saved codes, 0.1 migration, templates, text field
+core/src/tests.rs        differential tests vs the qrcode crate, ISO vectors, regressions
+src/main.rs              GAM registration and message loop
+src/app.rs               screens, keys, persistence
+src/ui.rs                drawing (one rectangle per dark run, batched)
+capture.py               Renode capture sequence (not yet run)
+```
 
 ## Author
 
-Made by Tyler Colby — [Colby's Data Movers, LLC](https://colbysdatamovers.com)
-
-Contact: [tyler@colbysdatamovers.com](mailto:tyler@colbysdatamovers.com) | [GitHub Issues](https://github.com/tbcolby/precursor-qrcode/issues)
-
----
-
-## License
-
-Licensed under the Apache License, Version 2.0.
-
-See [LICENSE](LICENSE) for the full text.
+Tyler Colby, [Colby's Data Movers, LLC](https://colbysdatamovers.com). Licensed under the Apache License, Version 2.0 (see [LICENSE](LICENSE)).

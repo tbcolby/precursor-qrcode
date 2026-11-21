@@ -1,3 +1,5 @@
+> Historical notes from version 0.1 (package `qrcode`). Some statements here (no version information needed, manifest key `qrcode`, Chat UX) were wrong or are outdated; see README.md for current behaviour.
+
 # QR CODE GENERATOR
 ## Design Specification
 
